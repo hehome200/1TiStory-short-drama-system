@@ -1,0 +1,52 @@
+{
+  "name": "1tistory",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "check:public-boundary": "node scripts/check-public-boundary.mjs",
+    "check:local-first": "node scripts/check-local-first.mjs",
+    "check:type-coverage": "node scripts/check-typecheck-coverage.mjs",
+    "check:functional-integrity": "node scripts/check-functional-integrity.mjs",
+    "generate:open-source-migration-docs": "node scripts/generate-open-source-migration-docs.mjs"
+  },
+  "dependencies": {
+    "@alicloud/ice20201109": "^6.19.0",
+    "@alicloud/videorecog-2020-03-20": "^1.0.0",
+    "@base-ui/react": "^1.5.0",
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
+    "@json-render/core": "^0.19.0",
+    "@json-render/react": "^0.19.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "dexie": "^4.0.11",
+    "framer-motion": "^12.38.0",
+    "lucide-react": "^1.17.0",
+    "mammoth": "^1.12.0",
+    "next": "^16.2.4",
+    "pdf-parse": "^1.1.1",
+    "playwright": "^1.59.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "tailwind-merge": "^3.6.0",
+    "tw-animate-css": "^1.4.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.4",
+    "shadcn": "^4.8.3",
+    "tailwindcss": "^4",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
+  }
+}

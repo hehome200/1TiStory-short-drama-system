@@ -1,0 +1,925 @@
+"use client";
+
+import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { WorkspaceFrame } from "@/components/workspace/workspace-frame";
+import { parseRewriteStreamStep } from "@/lib/ai/stream-preview";
+import type { GenerateRewriteResponse } from "@/lib/ai/types";
+import { generateRewritePayload } from "@/lib/local-ai/creative-generation";
+import { mergeProviderConfig } from "@/lib/provider-config";
+import { useWorkspaceShell } from "@/components/workspace/workspace-shell-context";
+import {
+  createRewriteProjectRecord,
+  CURRENT_REWRITE_PROJECT_ID_STORAGE_KEY,
+  INITIAL_REWRITE_DRAFT,
+  loadRewriteWorkspace,
+  REWRITE_PROJECTS_STORAGE_KEY,
+} from "@/lib/rewrite-projects";
+import { adaptRewriteOutlineToViewModel } from "@/components/workspace/shared-outline/adapters/rewrite-outline-adapter";
+import { OutlineWorkbench } from "@/components/workspace/shared-outline/outline-workbench";
+import type {
+  Character,
+  ModelProviderConfig,
+  RewriteDraft,
+  RewriteInfoFlowCharacter,
+  RewriteProjectRecord,
+  RewriteOverviewField,
+  RewriteStep,
+} from "@/lib/types";
+
+type RewriteSection = RewriteStep;
+
+const tabs: { id: RewriteStep; label: string }[] = [
+  { id: "infoflow", label: "信息流" },
+  { id: "overview", label: "故事梗概" },
+  { id: "characters", label: "人物小传" },
+  { id: "outlines", label: "分集大纲" },
+  { id: "script", label: "剧本正文" },
+];
+
+const genreOptions = ["都市职场", "豪门恩怨", "现代言情", "逆袭复仇"];
+const coreHookOptions = ["身份反转", "人物逆袭", "隐藏大佬", "萌宝", "神医", "豪门"];
+const styleOptions = ["爽文虐渣", "打脸复仇", "萌宠", "隐藏大佬", "甜虐交织"];
+
+function TextareaField({
+  label,
+  value,
+  onChange,
+  placeholder,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+}) {
+  return (
+    <label className="grid gap-3">
+      <span className="text-sm font-medium text-slate-200">{label}</span>
+      <textarea
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={placeholder}
+        className="min-h-32 rounded-3xl border border-white/10 bg-white/4 px-4 py-4 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-cyan-300/60"
+      />
+    </label>
+  );
+}
+
+function SelectTokens({
+  title,
+  options,
+  values,
+  onChange,
+  maxCount,
+}: {
+  title: string;
+  options: string[];
+  values: string[];
+  onChange: (values: string[]) => void;
+  maxCount?: number;
+}) {
+  const limit = maxCount ?? 5;
+  return (
+    <div className="grid gap-3">
+      <span className="text-sm font-medium text-slate-200">{title} <span className="text-slate-500">（不超过{limit}个）</span></span>
+      <div className="rounded-3xl border border-white/10 bg-white/4 p-4">
+        <div className="flex flex-wrap gap-2">
+          {options.map((option) => {
+            const active = values.includes(option);
+            const isFull = values.length >= limit && !active;
+            return (
+              <button
+                key={option}
+                onClick={() =>
+                  onChange(
+                    active
+                      ? values.filter((item) => item !== option)
+                      : [...values, option].slice(0, limit),
+                  )
+                }
+                disabled={isFull}
+                className={`rounded-full px-4 py-2 text-sm transition ${
+                  active
+                    ? "bg-white text-slate-950"
+                    : isFull
+                      ? "bg-white/4 text-slate-500 cursor-not-allowed"
+                      : "bg-white/8 text-slate-300 hover:bg-white/12"
+                }`}
+              >
+                {option}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function OverviewAiButton({
+  disabled,
+  loading,
+  onClick,
+}: {
+  disabled: boolean;
+  loading: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`inline-flex h-[30px] w-[30px] items-center justify-center rounded-[4px] transition ${
+        disabled ? "cursor-not-allowed opacity-40" : "cursor-pointer hover:bg-[#18181b]"
+      }`}
+      aria-label="AI生成"
+      title="AI生成"
+    >
+      {loading ? (
+        <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+      ) : (
+        <svg
+          width="16"
+          height="16"
+          viewBox="0 0 16 16"
+          fill="none"
+          xmlns="http://www.w3.org/2000/svg"
+        >
+          <path
+            d="M8 1.5L9.64 5.36L13.5 7L9.64 8.64L8 12.5L6.36 8.64L2.5 7L6.36 5.36L8 1.5Z"
+            fill="white"
+            fillOpacity="0.85"
+          />
+        </svg>
+      )}
+    </button>
+  );
+}
+
+export function RewriteStudio({ projectId }: { projectId?: string }) {
+  const router = useRouter();
+  const { isAuthenticated } = useWorkspaceShell();
+  const autoGeneratedProjectsRef = useRef<Set<string>>(new Set());
+  const generateStepRef = useRef<
+    (step: RewriteStep, overviewField?: RewriteOverviewField) => Promise<void>
+  >(async () => {});
+  const [projects, setProjects] = useState<RewriteProjectRecord[]>([]);
+  const [currentProjectId, setCurrentProjectId] = useState<string>("");
+
+  // 客户端加载项目数据
+  useEffect(() => {
+    const workspace = loadRewriteWorkspace();
+    setProjects(workspace.projects);
+    const initialProjectId =
+      projectId && workspace.projects.some((item) => item.id === projectId)
+        ? projectId
+        : workspace.currentProjectId;
+    setCurrentProjectId(initialProjectId);
+  }, [projectId]);
+  const [activeStep, setActiveStep] = useState<RewriteSection>("infoflow");
+  const [selectedCharacterId, setSelectedCharacterId] = useState("");
+  const [isGenerating, setIsGenerating] = useState<RewriteStep | null>(null);
+  const [overviewGeneratingField, setOverviewGeneratingField] =
+    useState<RewriteOverviewField | null>(null);
+  const [generationSource, setGenerationSource] = useState<"mock" | "aliyun" | "local" | null>(
+    null,
+  );
+  const [errorMessage, setErrorMessage] = useState("");
+  const [streamPreview, setStreamPreview] = useState("");
+  const resolvedProjectId =
+    projectId && projects.some((item: RewriteProjectRecord) => item.id === projectId)
+      ? projectId
+      : currentProjectId || undefined;
+  const currentProject = resolvedProjectId
+    ? projects.find((item: RewriteProjectRecord) => item.id === resolvedProjectId)
+    : projects[0];
+
+  const safeDraft = currentProject?.draft;
+  const draft: RewriteDraft = safeDraft
+    ? {
+        ...INITIAL_REWRITE_DRAFT,
+        ...safeDraft,
+        infoFlow: { ...INITIAL_REWRITE_DRAFT.infoFlow, ...safeDraft.infoFlow },
+        overview: { ...INITIAL_REWRITE_DRAFT.overview, ...safeDraft.overview },
+        outlines: { ...INITIAL_REWRITE_DRAFT.outlines, ...safeDraft.outlines },
+        script: { ...INITIAL_REWRITE_DRAFT.script, ...safeDraft.script },
+      }
+    : { ...INITIAL_REWRITE_DRAFT, title: "未命名项目" };
+  const providerConfig: ModelProviderConfig = mergeProviderConfig(
+    currentProject?.providerConfig,
+  );
+
+  useEffect(() => {
+    window.localStorage.setItem(REWRITE_PROJECTS_STORAGE_KEY, JSON.stringify(projects));
+  }, [projects]);
+
+  useEffect(() => {
+    if (resolvedProjectId) {
+      window.localStorage.setItem(
+        CURRENT_REWRITE_PROJECT_ID_STORAGE_KEY,
+        resolvedProjectId,
+      );
+    }
+  }, [resolvedProjectId]);
+
+  const selectedCharacter = useMemo(
+    () =>
+      draft.characters.find((item) => item.id === selectedCharacterId) ??
+      draft.characters[0],
+    [draft.characters, selectedCharacterId],
+  );
+  const streamingPatch =
+    isGenerating && streamPreview ? parseRewriteStreamStep(isGenerating, streamPreview) : null;
+  const safeInfoFlow = {
+    ...INITIAL_REWRITE_DRAFT.infoFlow,
+    ...draft.infoFlow,
+    overview: { ...INITIAL_REWRITE_DRAFT.infoFlow.overview, ...draft.infoFlow?.overview },
+    macro: { ...INITIAL_REWRITE_DRAFT.infoFlow.macro, ...draft.infoFlow?.macro },
+    episodes: { ...INITIAL_REWRITE_DRAFT.infoFlow.episodes, ...draft.infoFlow?.episodes },
+    characters: draft.infoFlow?.characters ?? INITIAL_REWRITE_DRAFT.infoFlow.characters,
+  };
+  const previewInfoFlow =
+    isGenerating === "infoflow" && streamingPatch?.infoFlow
+      ? { ...safeInfoFlow, ...streamingPatch.infoFlow }
+      : safeInfoFlow;
+  const previewOverview =
+    isGenerating === "overview" && streamingPatch?.overview
+      ? { ...draft.overview, ...streamingPatch.overview }
+      : draft.overview;
+  const previewCharacters =
+    isGenerating === "characters" && streamingPatch?.characters?.length
+      ? streamingPatch.characters
+      : draft.characters;
+  const previewSelectedCharacter =
+    previewCharacters.find((item) => item.id === selectedCharacterId) ?? previewCharacters[0];
+  const previewOutlines =
+    isGenerating === "outlines" && streamingPatch?.outlines
+      ? {
+          ...draft.outlines,
+          ...streamingPatch.outlines,
+          stageLabels:
+            streamingPatch.outlines.stageLabels?.length
+              ? streamingPatch.outlines.stageLabels
+              : draft.outlines.stageLabels,
+        }
+      : draft.outlines;
+  const previewScript =
+    isGenerating === "script" && streamingPatch?.script
+      ? { ...draft.script, ...streamingPatch.script }
+      : draft.script;
+  const canGenerateOverviewFields = Boolean(
+    previewOverview.audience &&
+      previewOverview.genre &&
+      previewOverview.coreHooks.length > 0 &&
+      previewOverview.styleTags.length > 0,
+  );
+
+  const updateProject = useCallback(
+    (updater: (current: RewriteProjectRecord) => RewriteProjectRecord) => {
+      if (!currentProject) return;
+      setProjects((current) =>
+        current.map((item) => (item.id === currentProject.id ? updater(item) : item)),
+      );
+    },
+    [currentProject?.id],
+  );
+
+  const updateDraft = useCallback(
+    (updater: (current: RewriteProjectRecord["draft"]) => RewriteProjectRecord["draft"]) => {
+      updateProject((current) => {
+        const nextDraft = updater(current.draft);
+
+        return {
+          ...current,
+          title: nextDraft.title,
+          draft: nextDraft,
+          updatedAt: new Date().toISOString(),
+        };
+      });
+    },
+    [updateProject],
+  );
+
+  const patchCharacter = useCallback(
+    (patch: Partial<Character>) => {
+      if (!selectedCharacter) return;
+
+      updateProject((current) => ({
+        ...current,
+        draft: {
+          ...current.draft,
+          characters: current.draft.characters.map((item: Character) =>
+            item.id === selectedCharacter.id ? { ...item, ...patch } : item,
+          ),
+        },
+        updatedAt: new Date().toISOString(),
+      }));
+    },
+    [selectedCharacter, updateProject],
+  );
+
+  const applyGeneration = useCallback((result: GenerateRewriteResponse) => {
+    setGenerationSource(result.source);
+    setErrorMessage("");
+
+    updateDraft((current) => {
+      switch (result.step) {
+        case "infoflow":
+          return {
+            ...current,
+            title: result.payload.sourceTitle || current.title,
+            infoFlow: {
+              ...current.infoFlow,
+              ...result.payload,
+            },
+          };
+        case "overview":
+          return { ...current, overview: { ...current.overview, ...result.payload } };
+        case "characters":
+          if (result.payload[0]) {
+            setSelectedCharacterId((existing) => existing || result.payload[0].id);
+          }
+
+          return { ...current, characters: result.payload };
+        case "outlines":
+          return { ...current, outlines: result.payload };
+        case "script":
+          return { ...current, script: result.payload };
+      }
+    });
+  }, [updateDraft]);
+
+  const generateStep = useCallback(async (
+    step: RewriteStep,
+    overviewField?: RewriteOverviewField,
+  ) => {
+    if (!isAuthenticated) return;
+    setIsGenerating(step);
+    setOverviewGeneratingField(step === "overview" ? overviewField ?? null : null);
+    setErrorMessage("");
+    setStreamPreview("");
+
+    try {
+      const result = await generateRewritePayload({ step, draft, providerConfig, overviewField });
+      setStreamPreview(JSON.stringify(result.payload, null, 2));
+      applyGeneration(result);
+      window.dispatchEvent(new Event("sboard:aura-refresh"));
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "生成失败");
+      window.dispatchEvent(new Event("sboard:aura-refresh"));
+    } finally {
+      setIsGenerating(null);
+      setOverviewGeneratingField(null);
+      setTimeout(() => setStreamPreview(""), 1200);
+    }
+  }, [applyGeneration, draft, providerConfig]);
+
+  useEffect(() => {
+    generateStepRef.current = generateStep;
+  }, [generateStep]);
+
+  useEffect(() => {
+    if (!currentProject) return;
+
+    const hasUploaded = currentProject.draft?.infoFlow?.uploaded ?? false;
+    const hasSourceText = !!currentProject.draft?.infoFlow?.sourceText?.trim();
+    const needsGeneration = !currentProject.draft?.infoFlow?.overview?.premise?.trim();
+    const notAutoGenerated = !autoGeneratedProjectsRef.current.has(currentProject.id);
+    const notGenerating = isGenerating === null;
+
+    const shouldAutoGenerateInfoFlow =
+      hasUploaded &&
+      hasSourceText &&
+      needsGeneration &&
+      notAutoGenerated &&
+      notGenerating;
+
+    if (!shouldAutoGenerateInfoFlow) return;
+
+    autoGeneratedProjectsRef.current.add(currentProject.id);
+    void generateStepRef.current("infoflow");
+  }, [
+    currentProject?.id,
+    currentProject?.draft?.infoFlow?.uploaded,
+    currentProject?.draft?.infoFlow?.sourceText,
+    currentProject?.draft?.infoFlow?.overview?.premise,
+    isGenerating,
+    currentProject,
+  ]);
+
+  return (
+    <WorkspaceFrame
+      primaryItems={[
+        { key: "original", label: "剧本原创", href: "/workspace/original", icon: "original" },
+        { key: "rewrite", label: "剧本改写", href: "/workspace/rewrite", icon: "rewrite", active: true },
+      ]}
+      contentClassName="scrollbar-thin p-5 md:p-8"
+    >
+      <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between">
+        <div>
+          <h1 className="text-3xl font-bold md:text-5xl">剧本改写</h1>
+          <p className="mt-3 text-sm text-slate-400">{draft.title}</p>
+        </div>
+        <div className="flex flex-wrap gap-3">
+          <button
+            onClick={() => router.push("/workspace/rewrite")}
+            className="rounded-full border border-white/10 px-5 py-3 text-sm hover:bg-white/6"
+          >
+            返回改写列表
+          </button>
+        </div>
+      </div>
+
+          <div className="mt-8 space-y-6">
+            <div className="flex flex-wrap gap-3">
+              {tabs.map((tab) => (
+                <button
+                  key={tab.id}
+                  onClick={() => setActiveStep(tab.id)}
+                  className={`rounded-2xl px-5 py-3 text-base font-medium ${
+                    activeStep === tab.id
+                      ? "bg-white text-slate-950"
+                      : "bg-white/6 text-slate-200 hover:bg-white/10"
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+
+            {errorMessage ? (
+              <div className="rounded-2xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+                {errorMessage}
+              </div>
+            ) : null}
+
+            {generationSource ? (
+              <div className="text-sm text-slate-400">
+                当前最近一次生成来源：
+                <span className="ml-2 rounded-full bg-white/8 px-3 py-1 text-slate-200">
+                  {generationSource === "aliyun" ? "阿里模型" : "本地 mock"}
+                </span>
+              </div>
+            ) : null}
+
+            {activeStep === "infoflow" && (
+              <div className="panel-soft rounded-[30px] p-6 md:p-8">
+                <header className="mb-6 flex items-center justify-between">
+                  <div>
+                    <h2 className="text-2xl font-semibold">信息流</h2>
+                    <p className="mt-2 text-sm text-slate-400">
+                      AI 从原始剧本提炼的故事信息，确认后可分发至后续页面
+                    </p>
+                  </div>
+                  <div className="flex gap-3">
+                    <button
+                      onClick={() => generateStep("infoflow")}
+                      disabled={!isAuthenticated || isGenerating === "infoflow" || !draft.infoFlow?.sourceText}
+                      className="rounded-full bg-linear-to-r from-cyan-400 to-violet-500 px-5 py-3 text-sm font-semibold text-slate-950 disabled:opacity-60"
+                    >
+                      {!isAuthenticated ? "需要登录后使用" : isGenerating === "infoflow" ? "生成中..." : "AI 生成全部"}
+                    </button>
+                  </div>
+                </header>
+
+                {/* 故事梗概 */}
+                <div className="mt-8">
+                  <h3 className="mb-4 text-xl font-semibold">故事梗概</h3>
+                  <div className="rounded-3xl border border-white/10 bg-white/4 p-6">
+                    <div className="grid gap-6 md:grid-cols-2">
+                      {/* 目标受众 */}
+                      <div className="grid gap-3">
+                        <span className="text-sm font-medium text-slate-400">目标受众</span>
+                        <div className="rounded-xl border border-white/10 bg-white/6 px-4 py-3 text-sm text-slate-200">
+                          {previewInfoFlow.overview.audience || <span className="text-slate-600">暂无内容</span>}
+                        </div>
+                      </div>
+
+                      {/* 题材类型 */}
+                      <div className="grid gap-3">
+                        <span className="text-sm font-medium text-slate-400">题材类型</span>
+                        <div className="rounded-xl border border-white/10 bg-white/6 px-4 py-3 text-sm text-slate-200">
+                          {previewInfoFlow.overview.genres || <span className="text-slate-600">暂无内容</span>}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-6 grid gap-6 md:grid-cols-2">
+                      {/* 核心设定 */}
+                      <div className="grid gap-3">
+                        <span className="text-sm font-medium text-slate-400">核心设定</span>
+                        <div className="rounded-xl border border-white/10 bg-white/6 px-4 py-3 text-sm text-slate-200">
+                          {previewInfoFlow.overview.coreHooks || <span className="text-slate-600">暂无内容</span>}
+                        </div>
+                      </div>
+
+                      {/* 风格元素 */}
+                      <div className="grid gap-3">
+                        <span className="text-sm font-medium text-slate-400">风格元素</span>
+                        <div className="rounded-xl border border-white/10 bg-white/6 px-4 py-3 text-sm text-slate-200">
+                          {previewInfoFlow.overview.styleTags || <span className="text-slate-600">暂无内容</span>}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-6 grid gap-6">
+                      {/* 世界观 */}
+                      <div className="grid gap-3">
+                        <span className="text-sm font-medium text-slate-400">世界观</span>
+                        <div className="rounded-xl border border-white/10 bg-white/6 px-4 py-3 text-sm text-slate-200">
+                          {previewInfoFlow.overview.worldview || <span className="text-slate-600">暂无内容</span>}
+                        </div>
+                      </div>
+
+                      {/* 核心亮点 */}
+                      <div className="grid gap-3">
+                        <span className="text-sm font-medium text-slate-400">核心亮点</span>
+                        <div className="rounded-xl border border-white/10 bg-white/6 px-4 py-3 text-sm text-slate-200">
+                          {previewInfoFlow.overview.highlight || <span className="text-slate-600">暂无内容</span>}
+                        </div>
+                      </div>
+
+                      {/* 核心梗概 */}
+                      <div className="grid gap-3">
+                        <span className="text-sm font-medium text-slate-400">核心梗概</span>
+                        <div className="min-h-36 rounded-xl border border-white/10 bg-white/6 px-4 py-3 text-sm text-slate-200">
+                          {previewInfoFlow.overview.premise || <span className="text-slate-600">暂无内容</span>}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 人物设定 */}
+                <div className="mt-8">
+                  <h3 className="mb-4 text-xl font-semibold">人物设定</h3>
+                  <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                    {previewInfoFlow.characters.map((character: RewriteInfoFlowCharacter) => (
+                      <div
+                        key={character.id}
+                        className="rounded-2xl border border-white/10 bg-white/4 p-5"
+                      >
+                        <div className="mb-2 flex items-baseline justify-between">
+                          <span className="text-lg font-semibold">{character.name}</span>
+                          <span className="text-sm text-slate-400">{character.age}岁</span>
+                        </div>
+                        <p className="text-sm text-slate-500">{character.traits}</p>
+                        <p className="mt-3 line-clamp-3 text-sm text-slate-300">
+                          {character.background}
+                        </p>
+                      </div>
+                    ))}
+                    {previewInfoFlow.characters.length === 0 && (
+                      <div className="col-span-full rounded-2xl border border-dashed border-white/10 bg-white/4 p-8 text-center text-slate-500">
+                        暂无角色，点击"AI 生成全部"按钮自动生成
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* 粗纲 */}
+                <div className="mt-8">
+                  <h3 className="mb-4 text-xl font-semibold">粗纲</h3>
+                  <div className="rounded-3xl border border-white/10 bg-white/4 p-6">
+                    <div className="min-h-48 rounded-xl border border-white/10 bg-white/6 px-4 py-3 text-sm text-slate-200">
+                      {previewInfoFlow.macro.content || <span className="text-slate-600">暂无内容</span>}
+                    </div>
+                  </div>
+                </div>
+
+                {/* 集纲 */}
+                <div className="mt-8">
+                  <h3 className="mb-4 text-xl font-semibold">集纲</h3>
+                  <div className="rounded-3xl border border-white/10 bg-white/4 p-6">
+                    <div className="space-y-4">
+                      {previewInfoFlow.episodes.episodes.map((episode: string, index: number) => (
+                        <div key={index} className="flex gap-4">
+                          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white/8 text-sm font-semibold text-slate-950">
+                            {index + 1}
+                          </span>
+                          <div className="flex-1 rounded-xl border border-white/10 bg-white/6 px-4 py-3 text-sm text-slate-200">
+                            {episode}
+                          </div>
+                        </div>
+                      ))}
+                      {previewInfoFlow.episodes.episodes.length === 0 && (
+                        <div className="rounded-2xl border border-dashed border-white/10 bg-white/4 p-8 text-center text-slate-500">
+                          暂无集纲，点击"AI 生成全部"按钮自动生成
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeStep === "overview" && (
+              <div className="panel-soft rounded-[30px] p-6 md:p-8">
+                <h2 className="sticky top-0 z-10 mb-[26px] border-b border-black bg-black/95 pb-[6px] text-base font-semibold leading-7 text-white">
+                  故事设定
+                </h2>
+                <div className="grid gap-8 md:grid-cols-2">
+                  <div className="grid gap-3">
+                    <h3 className="mb-[6px] text-sm font-medium leading-5 text-white/75">
+                      目标受众<i className="relative left-[3px] top-[2px] text-lg not-italic font-semibold text-red-500">*</i>
+                    </h3>
+                    <div className="flex gap-4">
+                      {["男频", "女频"].map((item) => (
+                        <button
+                          key={item}
+                          onClick={() =>
+                            updateProject((current) => ({
+                              ...current,
+                              draft: {
+                                ...current.draft,
+                                overview: { ...current.draft.overview, audience: item },
+                              },
+                              updatedAt: new Date().toISOString(),
+                            }))
+                          }
+                          className={`flex h-10 w-[154px] items-center justify-center gap-1 rounded-lg border text-[15px] font-medium transition ${
+                            previewOverview.audience === item
+                              ? item === "男频"
+                                ? "border-[#62b8fd] bg-[#62b8fd] text-white"
+                                : "border-[#f9b75b] bg-[#f9b75b] text-white"
+                              : item === "男频"
+                                ? "border-[#62b8fd] text-[#62b8fd] hover:bg-[#62b8fd]/15"
+                                : "border-[#f9b75b] text-[#f9b75b] hover:bg-[#f9b75b]/15"
+                          }`}
+                        >
+                          {item}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="grid gap-3">
+                    <h3 className="mb-[6px] text-sm font-medium leading-5 text-white/75">
+                      题材类型<i className="relative left-[3px] top-[2px] text-lg not-italic font-semibold text-red-500">*</i>
+                    </h3>
+                    <select
+                      value={previewOverview.genre}
+                      onChange={(event) =>
+                        updateProject((current) => ({
+                          ...current,
+                          draft: {
+                            ...current.draft,
+                            overview: { ...current.draft.overview, genre: event.target.value },
+                          },
+                          updatedAt: new Date().toISOString(),
+                        }))
+                      }
+                      className="h-10 rounded-md border border-white/10 bg-[#18181b] px-3 text-[15px] text-slate-100 outline-none transition hover:border-white/35 focus:border-white/65"
+                    >
+                      <option value="">选择或自定义输入背景</option>
+                      {genreOptions.map((option) => (
+                        <option key={option} value={option}>
+                          {option}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+                <div className="mt-8 grid gap-8 md:grid-cols-2">
+                  <SelectTokens
+                    title="核心设定 *"
+                    options={coreHookOptions}
+                    values={previewOverview.coreHooks}
+                    onChange={(values) =>
+                      updateProject((current) => ({
+                        ...current,
+                        draft: {
+                          ...current.draft,
+                          overview: { ...current.draft.overview, coreHooks: values },
+                        },
+                        updatedAt: new Date().toISOString(),
+                      }))
+                    }
+                  />
+                  <SelectTokens
+                    title="风格元素 *"
+                    options={styleOptions}
+                    values={previewOverview.styleTags}
+                    onChange={(values) =>
+                      updateProject((current) => ({
+                        ...current,
+                        draft: {
+                          ...current.draft,
+                          overview: { ...current.draft.overview, styleTags: values },
+                        },
+                        updatedAt: new Date().toISOString(),
+                      }))
+                    }
+                  />
+                </div>
+                <div className="mt-8 grid gap-8">
+                  {[
+                    {
+                      field: "worldview" as const,
+                      label: "世界观（选填）",
+                      value: previewOverview.worldview,
+                      placeholder:
+                        "例：世界存在一种失传的“织墨术”，顶尖修复师能以特制丝线“绣”补古画，不仅可恢复品相，技艺至高者甚至能通过画中“墨绣”窥见历史隐秘。",
+                    },
+                    {
+                      field: "highlight" as const,
+                      label: "核心亮点（选填）",
+                      value: previewOverview.highlight,
+                      placeholder:
+                        "例：穿书成作死女配，她反向操作，用沙雕和直球硬核攻略哑巴老公，结果把冰山霸总撩到开口说话！",
+                    },
+                    {
+                      field: "premise" as const,
+                      label: "核心梗概",
+                      value: previewOverview.premise,
+                      placeholder: "请输入内容，3000字以内",
+                    },
+                  ].map((item) => (
+                    <div key={item.field} className="group">
+                      <h3 className="relative mb-[6px] text-sm font-medium leading-5 text-white/75">
+                        {item.label}
+                        <span className="absolute right-0 top-[-5px] hidden group-hover:block">
+                          <OverviewAiButton
+                            disabled={!isAuthenticated || !canGenerateOverviewFields || isGenerating === "overview"}
+                            loading={
+                              isGenerating === "overview" &&
+                              overviewGeneratingField === item.field
+                            }
+                            onClick={() => generateStep("overview", item.field)}
+                          />
+                        </span>
+                      </h3>
+                      <div>
+                        <textarea
+                          value={item.value}
+                          onChange={(event) =>
+                            updateProject((current) => ({
+                              ...current,
+                              draft: {
+                                ...current.draft,
+                                overview: {
+                                  ...current.draft.overview,
+                                  [item.field]: event.target.value,
+                                },
+                              },
+                              updatedAt: new Date().toISOString(),
+                            }))
+                          }
+                          placeholder={item.placeholder}
+                          className={`hide-scrollbar w-full rounded-md border-0 bg-[#18181b] px-3 py-2 text-base font-normal leading-6 text-white outline transition placeholder:text-slate-400/50 ${
+                            isGenerating === "overview" &&
+                            overviewGeneratingField === item.field
+                              ? "outline outline-1 outline-white/65"
+                              : "outline-transparent hover:outline-white/65 focus:outline-white/65"
+                          } ${
+                            item.field === "premise" ? "min-h-32" : "min-h-16"
+                          }`}
+                        />
+                      </div>
+                    </div>
+                  ))}
+                  {!canGenerateOverviewFields ? (
+                    <div className="text-sm text-amber-200/80">
+                      请先选完目标受众、题材类型、核心设定、风格元素，再生成世界观、核心亮点和故事梗概。
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            )}
+
+            {activeStep === "characters" && (
+              <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_420px]">
+                <div className="panel-soft rounded-[30px] p-6 md:p-8">
+                  <div className="mb-5 flex items-center justify-between">
+                    <h2 className="text-2xl font-semibold">人物小传</h2>
+                    <button
+                      onClick={() => generateStep("characters")}
+                      disabled={!isAuthenticated || isGenerating === "characters"}
+                      className="rounded-full bg-linear-to-r from-cyan-400 to-violet-500 px-5 py-3 text-sm font-semibold text-slate-950 disabled:opacity-60"
+                    >
+                      {!isAuthenticated ? "需要登录后使用" : isGenerating === "characters" ? "AI改写中..." : "AI改写 50"}
+                    </button>
+                  </div>
+                  {previewSelectedCharacter ? (
+                    <div className="space-y-5">
+                      <div className="grid gap-5 md:grid-cols-[minmax(0,1fr)_140px_140px]">
+                        <label className="grid gap-3">
+                          <span className="text-sm font-medium text-slate-200">姓名</span>
+                          <input
+                            value={previewSelectedCharacter.name}
+                            onChange={(event) => patchCharacter({ name: event.target.value })}
+                            className="h-14 rounded-2xl border border-white/10 bg-white/4 px-4 text-sm text-slate-100 outline-none"
+                          />
+                        </label>
+                        <label className="grid gap-3">
+                          <span className="text-sm font-medium text-slate-200">定位</span>
+                          <input
+                            value={previewSelectedCharacter.role}
+                            onChange={(event) => patchCharacter({ role: event.target.value })}
+                            className="h-14 rounded-2xl border border-white/10 bg-white/4 px-4 text-sm text-slate-100 outline-none"
+                          />
+                        </label>
+                        <label className="grid gap-3">
+                          <span className="text-sm font-medium text-slate-200">年龄</span>
+                          <input
+                            value={String(previewSelectedCharacter.age)}
+                            onChange={(event) =>
+                              patchCharacter({ age: Number(event.target.value) || 0 })
+                            }
+                            className="h-14 rounded-2xl border border-white/10 bg-white/4 px-4 text-sm text-slate-100 outline-none"
+                          />
+                        </label>
+                      </div>
+                      <TextareaField
+                        label="背景"
+                        value={previewSelectedCharacter.background}
+                        onChange={(value) => patchCharacter({ background: value })}
+                      />
+                    </div>
+                  ) : null}
+                </div>
+                <div className="grid auto-rows-[160px] gap-4 sm:grid-cols-2">
+                  {previewCharacters.map((character: Character) => (
+                    <button
+                      key={character.id}
+                      onClick={() => setSelectedCharacterId(character.id)}
+                      className={`rounded-[28px] border p-5 text-left ${
+                        previewSelectedCharacter?.id === character.id
+                          ? "border-white bg-white/6"
+                          : "border-white/8 bg-white/4 hover:bg-white/8"
+                      }`}
+                    >
+                      <div className="text-3xl font-semibold">{character.name}</div>
+                    </button>
+                  ))}
+                  <div className="rounded-[28px] border border-dashed border-white/10 bg-white/4 p-5 text-left text-4xl text-slate-300">
+                    +
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeStep === "outlines" && (
+              <div className="space-y-5">
+                <div className="flex justify-end">
+                  <button
+                    onClick={() => generateStep("outlines")}
+                    disabled={!isAuthenticated || isGenerating === "outlines"}
+                    className="rounded-full bg-linear-to-r from-cyan-400 to-violet-500 px-5 py-3 text-sm font-semibold text-slate-950 disabled:opacity-60"
+                  >
+                    {!isAuthenticated ? "需要登录后使用" : isGenerating === "outlines"
+                      ? "提炼中..."
+                      : "AI提炼当前粗纲 30"}
+                  </button>
+                </div>
+                <TextareaField
+                  label="粗纲（选填）"
+                  value={previewOutlines.macro}
+                  onChange={(value) =>
+                    updateProject((current) => ({
+                      ...current,
+                      draft: {
+                        ...current.draft,
+                        outlines: { ...current.draft.outlines, macro: value },
+                      },
+                      updatedAt: new Date().toISOString(),
+                    }))
+                  }
+                  placeholder="请输入内容，3000字以内"
+                />
+                <OutlineWorkbench
+                  {...adaptRewriteOutlineToViewModel(previewOutlines)}
+                  readonly
+                />
+              </div>
+            )}
+
+            {activeStep === "script" && (
+              <div className="panel-soft rounded-[30px] p-6 md:p-8">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-2xl font-semibold">{previewScript.episode}</h2>
+                  <div className="flex gap-3">
+                    <button
+                      onClick={() => generateStep("script")}
+                      disabled={!isAuthenticated || isGenerating === "script"}
+                      className="rounded-full bg-white px-5 py-3 text-sm font-semibold text-slate-950 disabled:opacity-60"
+                    >
+                      {!isAuthenticated ? "需要登录后使用" : isGenerating === "script" ? "重生成中..." : "重新生成正文 100"}
+                    </button>
+                    <button className="rounded-full border border-white/10 px-5 py-3 text-sm hover:bg-white/6">
+                      导出为 Word
+                    </button>
+                  </div>
+                </div>
+                <div className="mt-8 rounded-[28px] border border-white/10 bg-white/4 p-6 text-lg leading-9 text-slate-200 whitespace-pre-line">
+                  {previewScript.content}
+                  {isGenerating === "script" && streamPreview ? (
+                    <span className="ml-1 inline-block h-4 w-2 animate-pulse rounded-sm bg-cyan-300 align-middle" />
+                  ) : null}
+                </div>
+              </div>
+            )}
+
+          </div>
+    </WorkspaceFrame>
+  );
+}
