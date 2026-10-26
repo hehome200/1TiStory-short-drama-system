@@ -1,3 +1,12 @@
+## InkOS × Claude Agent SDK（独立开源工作流）
+
+- 工作流源码与用法：[packages/inkos-claude-workflow](packages/inkos-claude-workflow/README.md)
+- 独立包：`@1tistory/inkos-claude-workflow`，AGPL-3.0-only，保留上游 InkOS Skills 与来源署名。
+- 该包不包含第二套 Agent Harness、1TiStory 私有网站源码、数据库或模型凭证；模型执行由宿主现有 Claude Agent SDK 承担。
+- 当前交付是可独立运行 ZERO-CALL 测试的工作流源码，不代表网站正式 SDK REAL 已启用或作品质量已完成 A/B 验收。
+
+---
+
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
 ## Getting Started
