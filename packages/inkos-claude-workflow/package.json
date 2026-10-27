@@ -1,0 +1,21 @@
+{
+  "name": "@1tistory/inkos-claude-workflow",
+  "version": "0.1.0",
+  "private": false,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "skills",
+    "AGPL-3.0.txt",
+    "README.md",
+    "UPSTREAM.md",
+    "test"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/workflow.test.ts"
+  }
+}
