@@ -80,11 +80,19 @@ export async function runInkOSWorkflow(input:RunInput){
  ].join("\n\n");
  if(authority.length>22000)throw Error("INKOS_CONTEXT_OVER_BUDGET");
  const phases:PhaseResult[]=[];
+ // All outputs must fit into subsequent 30k-character SDK prompts.
+ const MAX_PROMPT_CHARS=30000;
+ const MAX_OUTPUT:Record<Phase,number>={
+  plan:1800,compose:2400,write:18000,observe:1800,audit:2400,revise:18000,
+ };
  const run=async(phase:Phase,prompt:string)=>{
-  if(prompt.length>30000)throw Error("INKOS_PROMPT_TOO_LONG");
+  const boundedPrompt=prompt+"\nOUTPUT_LIMIT_CHARS="+MAX_OUTPUT[phase]+
+   "; keep the full response within this limit.";
+  if(boundedPrompt.length>MAX_PROMPT_CHARS)throw Error("INKOS_PROMPT_TOO_LONG");
   const requestId=input.requestId+"-"+phase;
-  const response=phaseOutput(await input.invoke({phase,requestId,prompt,sourceSha256}),
-   60000,"INKOS_"+phase.toUpperCase()+"_EMPTY");
+  const response=phaseOutput(await input.invoke({
+   phase,requestId,prompt:boundedPrompt,sourceSha256,
+  }),MAX_OUTPUT[phase],"INKOS_"+phase.toUpperCase()+"_EMPTY_OR_OVERSIZE");
   phases.push({phase,requestId,sha256:digest(response),text:response});
   return response;
  };
@@ -104,26 +112,57 @@ export async function runInkOSWorkflow(input:RunInput){
  const o=json(observe,"INKOS_OBSERVE_JSON_INVALID");
  if(!Array.isArray(o.stateDeltas)||!Array.isArray(o.continuityWarnings))
   throw Error("INKOS_OBSERVE_CONTRACT_INVALID");
- const audit=await run("audit",authority+"\nBODY:\n"+candidate+
-  "\nPROPOSED DELTAS:\n"+observe+
-  "\nReturn JSON: observations[], sourceConflicts[], suggestedFixes[]. Evidence-based, do not score or rewrite.");
+ const initialCandidateSha256=digest(candidate);
+ // Keep complete CURRENT facts where they fit. For long bodies use an
+ // explicitly labeled plan projection rather than silently truncating canon.
+ const auditTail="\nBODY:\n"+candidate+"\nPROPOSED DELTAS:\n"+observe+
+  "\nReturn JSON: observations[], sourceConflicts[], suggestedFixes[]. "+
+  "Evidence-only; do not invent CURRENT facts, score or rewrite.";
+ const fullAudit=authority+auditTail;
+ const auditContextMode=fullAudit.length+96<=MAX_PROMPT_CHARS
+  ? "CURRENT_INPUTS" as const:"PLAN_PROJECTION" as const;
+ const auditPrefix=auditContextMode==="CURRENT_INPUTS"?authority:
+  "CURRENT SOURCE SHA256="+sourceSha256+
+  "\nREVIEW SCOPE=PLAN_PROJECTION; full source unavailable in this stage. "+
+  "Do not claim source conflicts verified without direct evidence."+
+  "\nLOCKED PLAN:\n"+plan;
+ const audit=await run("audit",auditPrefix+auditTail);
  const a=json(audit,"INKOS_AUDIT_JSON_INVALID");
  if(!Array.isArray(a.observations)||!Array.isArray(a.sourceConflicts)||
     !Array.isArray(a.suggestedFixes))throw Error("INKOS_AUDIT_CONTRACT_INVALID");
  if(input.revisionIntent){
   if(!["spot-fix","polish","rewrite","rework"].includes(input.revisionIntent))
    throw Error("INKOS_REVISION_MODE_INVALID");
-  candidate=await run("revise",authority+"\nEXPLICIT REVISION: "+input.revisionIntent+
+  const reviseTail="\nEXPLICIT REVISION: "+input.revisionIntent+
    "\nCURRENT CANDIDATE:\n"+candidate+"\nREVIEW:\n"+audit+
-   "\nOutput full revised episode in INPUT4 format. No canonical Apply.");
+   "\nOutput full revised episode in INPUT4 format. No canonical Apply.";
+  const fullRevise=authority+reviseTail;
+  const reviseAuthority=fullRevise.length+96<=MAX_PROMPT_CHARS?authority:
+   "CURRENT SOURCE SHA256="+sourceSha256+
+   "\nLOCKED PLAN:\n"+plan+
+   "\nSCENE DESIGN:\n"+compose+
+   "\nREVISION SCOPE=PLAN_PROJECTION. Do not invent new facts.";
+  candidate=await run("revise",reviseAuthority+reviseTail);
  }
+ const reviewedCandidateSha256=digest(candidate)===initialCandidateSha256
+  ?initialCandidateSha256:null;
+ const priorReview=reviewedCandidateSha256?null:{
+  candidateSha256:initialCandidateSha256,
+  sourceContextMode:auditContextMode,
+  proposedStateDeltas:o.stateDeltas,
+  reviewObservations:a.observations,
+  sourceConflicts:a.sourceConflicts,
+ };
  return Object.freeze({
   projectId:s.projectId,episodeNumber:s.episodeNumber,
   sourceRevision:s.sourceRevision,sourceSha256,
   outputDisposition:"candidate_requires_review" as const,
   candidate,candidateSha256:digest(candidate),
-  proposedStateDeltas:o.stateDeltas,reviewObservations:a.observations,
-  sourceConflicts:a.sourceConflicts,phases,
+  reviewStatus:reviewedCandidateSha256?"REVIEWED":"REVIEW_REQUIRED" as const,
+  reviewedCandidateSha256,reviewContextMode:auditContextMode,priorReview,
+  proposedStateDeltas:reviewedCandidateSha256?o.stateDeltas:null,
+  reviewObservations:reviewedCandidateSha256?a.observations:null,
+  sourceConflicts:reviewedCandidateSha256?a.sourceConflicts:null,phases,
   sdkExecutions:phases.length,applied:false as const,
   providerBillingStatus:"EXTERNAL_OWNER" as const,
  });

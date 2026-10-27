@@ -29,3 +29,51 @@ test("invalid CURRENT evidence and malformed phase fail closed",async()=>{
  await assert.rejects(runInkOSWorkflow({source,requestId:"public-test-0004",
   invoke:async x=>x.phase==="plan"?"junk":outputs[x.phase]}),/PLAN_JSON_INVALID/);
 });
+test("revised body never inherits original draft's state and audit",async()=>{
+ const answers={...outputs,
+  write:'{"episodeNumber":1,"event":"letter destroyed"}',
+  observe:'{"stateDeltas":["letter destroyed"],"continuityWarnings":[]}',
+  audit:'{"observations":["letter destroyed"],"sourceConflicts":["ledger missing"],"suggestedFixes":[]}',
+  revise:'{"episodeNumber":1,"event":"letter preserved"}'};
+ const initial=await runInkOSWorkflow({source,requestId:"review-test-0001",
+  invoke:async a=>answers[a.phase]});
+ assert.equal(initial.reviewStatus,"REVIEWED");
+ assert.equal(initial.reviewedCandidateSha256,initial.candidateSha256);
+ assert.deepEqual(initial.proposedStateDeltas,["letter destroyed"]);
+ const revised=await runInkOSWorkflow({source,requestId:"review-test-0002",
+  revisionIntent:"rewrite",invoke:async a=>answers[a.phase]});
+ assert.equal(revised.reviewStatus,"REVIEW_REQUIRED");
+ assert.equal(revised.reviewedCandidateSha256,null);
+ assert.equal(revised.proposedStateDeltas,null);
+ assert.equal(revised.reviewObservations,null);
+ assert.equal(revised.sourceConflicts,null);
+ assert.equal(revised.priorReview?.candidateSha256,initial.candidateSha256);
+ assert.deepEqual(revised.priorReview?.proposedStateDeltas,["letter destroyed"]);
+ assert.notEqual(revised.candidateSha256,revised.priorReview?.candidateSha256);
+});
+test("long CURRENT input and 12k body complete within 30k prompts",async()=>{
+ const longSource={...source,plot:"X".repeat(19000)};
+ const bigBody='{"episodeNumber":1,"text":"'+ "B".repeat(11900)+'"}';
+ const phases:Phase[]=[];
+ const res=await runInkOSWorkflow({source:longSource,
+  requestId:"budget-test-0001",revisionIntent:"polish",
+  invoke:async a=>{
+   phases.push(a.phase);
+   assert.ok(a.prompt.length<=30000);
+   assert.ok(a.prompt.includes("OUTPUT_LIMIT_CHARS="));
+   return a.phase==="write"?bigBody:a.phase==="revise"?
+    bigBody.replace("BBBBBB","CCCCCC"):outputs[a.phase];
+  }});
+ assert.equal(res.reviewContextMode,"PLAN_PROJECTION");
+ assert.equal(res.reviewStatus,"REVIEW_REQUIRED");
+ assert.equal(res.sdkExecutions,6);
+ assert.deepEqual(phases,["plan","compose","write","observe","audit","revise"]);
+});
+test("oversized body fails before downstream paid calls",async()=>{
+ const phases:Phase[]=[];
+ await assert.rejects(runInkOSWorkflow({source,requestId:"budget-test-0002",
+  invoke:async a=>{phases.push(a.phase);
+   return a.phase==="write"?"W".repeat(18001):outputs[a.phase];
+  }}),/INKOS_WRITE_EMPTY_OR_OVERSIZE/);
+ assert.deepEqual(phases,["plan","compose","write"]);
+});
