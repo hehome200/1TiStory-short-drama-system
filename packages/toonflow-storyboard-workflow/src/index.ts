@@ -343,6 +343,9 @@ export async function runWithHost(input:{
     const receipt=acceptReceipt(input.source,receipts,next.action,raw);
     await input.append(receipt);
   }
-  return {status:"blocked",reason:"STORYBOARD_STAGE_BOUND_REACHED",
-    completedStages:(await input.loadReceipts()).length};
+  const receipts=await input.loadReceipts();
+  const progress=planWorkflow(input.source,receipts);
+  return progress.status==="next"?
+    {status:"blocked",reason:"STORYBOARD_STAGE_BOUND_REACHED",
+      completedStages:receipts.length}:progress;
 }
