@@ -2,6 +2,20 @@
 
 本仓库提供一份 **1TiStory 早期网站公开版源码**，以及可独立使用的 **InkOS × Claude Agent SDK 短剧创作工作流**。两者应分开理解：公开网站代码不等于当前 1TiStory / sboard 网站的实时源码、部署或业务数据。
 
+## Toonflow 专业文字分镜工作流
+
+已增加独立 **[Toonflow storyboardTeam × 1TiStory 工作流](packages/toonflow-storyboard-workflow/README.md)**。原版 Toonflow MIT Skill、导演/Writer/Reviewer 指令、连续性知识和 LICENSE 完整保留在 `upstream/`，上游 SHA 与 Git blob 固定；新增的是通用 Host 编排，不另建模型、Agent Session、数据库或计费系统。
+
+```text
+CURRENT 剧本 → director 计划 → 逐场 writer 分镜 → 逐场 reviewer 审阅
+                                      ↓
+                          Candidate 待用户审查
+```
+
+支持按 Work Session 已持久化回执恢复，不自动重派 UNKNOWN；工作流包自身不会在浏览器关闭后独立运行，仍须正式网站既有服务端 Worker 挂接。该包独立采用 MIT，与 InkOS AGPL 工作流分离。可运行包内 `npm test` 完成 ZERO-CALL 资格检查。
+
+以后涉及成熟开源能力，采用 [上游原版优先、固定 SHA、隔离 Host 适配、独立工作流包、资格与许可证核验](docs/upstream-workflow-reuse.md) 的标准流程，避免重复重写已经稳定的上游方法。
+
 ## InkOS 短剧创作工作流
 
 **[查看独立工作流 README 与接入指南](packages/inkos-claude-workflow/README.md)**

@@ -1,0 +1,25 @@
+name: Toonflow storyboard portable workflow
+on:
+  pull_request:
+    paths:
+      - "packages/toonflow-storyboard-workflow/**"
+      - ".github/workflows/toonflow-storyboard-test.yml"
+  push:
+    branches: [main]
+    paths:
+      - "packages/toonflow-storyboard-workflow/**"
+      - ".github/workflows/toonflow-storyboard-test.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  zero-call:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: ZERO-CALL / exact upstream verification
+        working-directory: packages/toonflow-storyboard-workflow
+        run: npm test
